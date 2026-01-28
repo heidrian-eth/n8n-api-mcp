@@ -1,100 +1,141 @@
 # n8n API MCP Server
 
-A Model Context Protocol (MCP) server designed to interact with a self-hosted n8n instance.
-
-This server provides tools to:
-- Execute calls to the n8n API.
-- Search for n8n API endpoints using a local database populated from an OpenAPI specification.
-- Store and retrieve frequently used or successful API calls using a "Fast Memory" database for quicker natural language access.
+A Model Context Protocol (MCP) server for interacting with n8n instances. Provides comprehensive workflow management, execution monitoring, and API exploration tools.
 
 ## Features
 
-### Databases
-- **API Specification Database (`api_spec.db`):** Stores details about n8n API endpoints, loaded from an OpenAPI/Swagger JSON file. Used by search and detail tools.
-- **Fast Memory Database (`fast_memory.db`):** Caches successful API calls linked to natural language queries. Allows for quick retrieval of previously used calls and suggests saving new successful calls.
+- **22 tools** for complete n8n API interaction
+- Workflow CRUD operations with local validation
+- Execution and credential management
+- API endpoint discovery with OpenAPI spec support
+- Fast Memory cache for frequently used API calls
 
-### Tools
-- **`search_api_endpoints`**: Search the local API spec database for endpoints matching a query (path, summary, description, tags).
-- **`get_api_endpoint_details`**: Retrieve detailed information (parameters, request body, responses) for a specific endpoint (path and method) from the local API spec database.
-- **`execute_api_call`**: Execute an API call to the configured n8n instance. Checks Fast Memory first; if not found, prompts to save the call to Fast Memory upon success.
-- **`natural_language_api_search`**: Search for API calls using natural language. Checks Fast Memory first, then falls back to searching the API spec database based on the query.
-- **`save_to_fast_memory`**: Manually save an API call (path, method, params, data) along with its original natural language query and a description to the Fast Memory database.
-- **`list_fast_memory`**: List entries currently stored in the Fast Memory database, optionally filtering by a search term.
-- **`delete_from_fast_memory`**: Delete a specific entry from the Fast Memory database by its ID.
-- **`clear_fast_memory`**: Remove all entries from the Fast Memory database.
-- **`load_api_spec_from_json`**: Load or update the API Specification database (`api_spec.db`) by parsing an OpenAPI/Swagger JSON file.
-- **`send_raw_api_request`**: Execute an API call using a raw request string (e.g., "GET /workflows?limit=5"). Uses the same underlying logic as `execute_api_call`, including Fast Memory checks and save prompts.
+## Tools
+
+### Workflow Management (7 tools)
+
+| Tool | Description |
+|------|-------------|
+| `list_workflows` | List all workflows with optional filtering by active status |
+| `get_workflow` | Get a workflow by ID with full nodes, connections, and settings |
+| `create_workflow` | Create workflow with local JSON validation before submission |
+| `update_workflow` | Update workflow (fetches existing, merges updates, saves) |
+| `validate_workflow` | Validate workflow JSON structure before submission |
+| `activate_workflow` | Activate/publish a workflow |
+| `deactivate_workflow` | Deactivate a workflow |
+
+### Execution Management (2 tools)
+
+| Tool | Description |
+|------|-------------|
+| `list_executions` | List executions with filters (workflowId, status, limit) |
+| `get_execution` | Get execution details including input/output data |
+
+### Credential Management (2 tools)
+
+| Tool | Description |
+|------|-------------|
+| `list_credentials` | List available credentials (metadata only) |
+| `get_credential_schema` | Get configuration schema for a credential type |
+
+### API Discovery (4 tools)
+
+| Tool | Description |
+|------|-------------|
+| `search_api_endpoints` | Search local API spec database for endpoints |
+| `get_api_endpoint_details` | Get detailed endpoint info (parameters, request body, responses) |
+| `load_api_spec_from_json` | Load OpenAPI spec from a JSON file |
+| `download_api_spec` | Download latest n8n OpenAPI spec from GitHub |
+
+### Core API Tools (4 tools)
+
+| Tool | Description |
+|------|-------------|
+| `execute_api_call` | Execute any API call to n8n instance |
+| `send_raw_api_request` | Execute API call using raw request string |
+| `natural_language_api_search` | Search for API calls using natural language |
+
+### Fast Memory Cache (3 tools)
+
+| Tool | Description |
+|------|-------------|
+| `save_to_fast_memory` | Save successful API call for quick retrieval |
+| `list_fast_memory` | List cached API calls |
+| `delete_from_fast_memory` | Delete a cached entry |
+| `clear_fast_memory` | Clear all cached entries |
 
 ## Setup
 
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/jasondsmith72/N8N-api-MCP.git
-    cd N8N-api-MCP
-    ```
-2.  **Install dependencies:**
-    ```bash
-    npm install
-    ```
-3.  **Build the server:**
-    ```bash
-    npm run build
-    ```
-    This compiles the TypeScript code to JavaScript in the `build` directory.
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/heidrian-eth/n8n-api-mcp.git
+   cd n8n-api-mcp
+   ```
+
+2. **Install dependencies:**
+   ```bash
+   npm install
+   ```
+
+3. **Build the server:**
+   ```bash
+   npm run build
+   ```
 
 ## Configuration
 
-This server requires environment variables to connect to your n8n instance. These are typically set in your MCP client's configuration file (e.g., `cline_mcp_settings.json`).
+Set these environment variables in your MCP client configuration:
 
-- **`N8N_URL`**: The base URL of your n8n instance (e.g., `http://your-n8n.example.com`). Defaults to `http://localhost:5678` if not set.
-- **`N8N_API_KEY`**: Your n8n API key for authentication.
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `N8N_URL` | Your n8n instance URL | `http://localhost:5678` |
+| `N8N_API_KEY` | Your n8n API key | Required |
 
-## Loading the API Specification
+## MCP Client Configuration
 
-Before using the search tools (`search_api_endpoints`, `natural_language_api_search`), you need to populate the API Specification database.
+### Claude Code / Cline
 
-1.  Obtain the OpenAPI (Swagger) JSON specification file for your n8n version. This might be available from the n8n documentation or potentially downloadable from your instance (e.g., `/api/v1/docs-json`).
-2.  Use the `load_api_spec_from_json` tool, providing the absolute path to the downloaded JSON file:
-    ```
-    load_api_spec_from_json(json_file_path="C:\\path\\to\\your\\n8n-openapi.json")
-    ```
-
-## Installation for Cline / Claude Desktop
-
-Add the following configuration to your `cline_mcp_settings.json` (adjust the path to `index.js` based on your clone location):
+Add to your MCP settings:
 
 ```json
 {
   "mcpServers": {
-    "... other servers ...": {},
     "n8n-api-mcp": {
       "command": "node",
-      "args": [
-        "C:\\MCP-Servers\\N8N-api-MCP\\build\\index.js" // <-- Update this path if needed
-      ],
+      "args": ["./path/to/n8n-api-mcp/build/index.js"],
       "env": {
-        "N8N_URL": "YOUR_N8N_INSTANCE_URL", // e.g., "http://192.168.1.100:5678"
-        "N8N_API_KEY": "YOUR_N8N_API_KEY_HERE"
-      },
-      "disabled": false,
-      "autoApprove": []
+        "N8N_URL": "https://your-instance.app.n8n.cloud",
+        "N8N_API_KEY": "your-api-key"
+      }
     }
   }
 }
 ```
-*(Remember to replace `YOUR_N8N_INSTANCE_URL` and `YOUR_N8N_API_KEY_HERE` with your actual values)*
+
+## Loading the API Specification
+
+Populate the API endpoint database for search functionality:
+
+**Option 1: Download from GitHub (recommended)**
+```
+download_api_spec
+```
+
+**Option 2: Load from local file**
+```
+load_api_spec_from_json(json_file_path="/path/to/n8n-openapi.json")
+```
 
 ## Development
 
-For development with auto-rebuild on file changes:
 ```bash
+# Watch mode with auto-rebuild
 npm run watch
-```
 
-### Debugging
-
-Use the [MCP Inspector](https://github.com/modelcontextprotocol/inspector) for easier debugging:
-```bash
+# Debug with MCP Inspector
 npm run inspector
 ```
-The Inspector provides a web interface to view MCP communication.
+
+## License
+
+MIT

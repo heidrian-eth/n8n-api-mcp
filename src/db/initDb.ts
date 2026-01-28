@@ -1,8 +1,13 @@
 import sqlite3 from 'sqlite3';
 import path from 'path';
 import fs from 'fs';
+import { fileURLToPath } from 'url';
 
-const dbDir = path.resolve(__dirname, '../../db'); // Store DBs in project root/db
+// ES Module compatible __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const dbDir = path.resolve(__dirname, '../../db'); // Store DBs in mcp/db
 const apiSpecDbPath = path.join(dbDir, 'api_spec.db');
 const fastMemoryDbPath = path.join(dbDir, 'fast_memory.db');
 
@@ -77,7 +82,7 @@ CREATE TABLE IF NOT EXISTS fast_memory (
 );
 
 CREATE INDEX IF NOT EXISTS idx_fast_memory_nl_query ON fast_memory (natural_language_query);
-CREATE INDEX IF NOT EXISTS idx_fast_memory_path_method ON fast_memory (api_path, api_method); -- Index for faster execute_api_call lookup
+CREATE INDEX IF NOT EXISTS idx_fast_memory_path_method ON fast_memory (api_path, api_method);
 `;
 
 export async function setupDatabases(): Promise<{ apiSpecDb: sqlite3.Database, fastMemoryDb: sqlite3.Database }> {
@@ -89,11 +94,10 @@ export async function setupDatabases(): Promise<{ apiSpecDb: sqlite3.Database, f
     return { apiSpecDb, fastMemoryDb };
   } catch (error) {
     console.error('Failed to initialize databases:', error);
-    process.exit(1); // Exit if databases can't be set up
+    process.exit(1);
   }
 }
 
-// Example function to close databases (call this on server shutdown)
 export function closeDatabases(dbs: { apiSpecDb?: sqlite3.Database, fastMemoryDb?: sqlite3.Database }): Promise<void[]> {
     const promises: Promise<void>[] = [];
     if (dbs.apiSpecDb) {
@@ -123,14 +127,4 @@ export function closeDatabases(dbs: { apiSpecDb?: sqlite3.Database, fastMemoryDb
         }));
     }
     return Promise.all(promises);
-}
-
-// Optional: Run setup directly if script is executed standalone
-if (require.main === module) {
-  setupDatabases().then(({ apiSpecDb, fastMemoryDb }) => {
-    console.log('Standalone DB setup complete.');
-    closeDatabases({ apiSpecDb, fastMemoryDb });
-  }).catch(error => {
-    console.error('Standalone DB setup failed:', error);
-  });
 }

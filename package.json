@@ -1,7 +1,7 @@
 {
   "name": "n8n-api-mcp",
-  "version": "0.1.0",
-  "description": "A Model Context Protocol server",
+  "version": "0.2.0",
+  "description": "MCP Server for n8n API with workflow building tools",
   "private": true,
   "type": "module",
   "bin": {
@@ -23,6 +23,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.11.24",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "yaml": "^2.8.2"
   }
 }

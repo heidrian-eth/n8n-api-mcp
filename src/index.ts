@@ -2,8 +2,11 @@
 
 /**
  * MCP Server for interacting with an n8n instance.
- * Provides tools for searching API endpoints, executing calls,
- * and managing a 'fast memory' cache for natural language queries.
+ * Provides tools for:
+ * - Searching API endpoints and executing calls
+ * - Managing 'fast memory' cache for natural language queries
+ * - Creating, updating, and validating workflows
+ * - Managing executions and credentials
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -16,41 +19,27 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import axios, { AxiosInstance } from 'axios';
 import sqlite3 from 'sqlite3';
-import fs from 'fs/promises'; // Use promises version of fs
-import path from 'path'; // Needed for path operations
-import { setupDatabases, closeDatabases } from './db/initDb.js'; // Use .js extension for ES modules
+import fs from 'fs/promises';
+import { setupDatabases, closeDatabases } from './db/initDb.js';
+import { workflowToolDefinitions, handleWorkflowTool } from './tools/workflow.js';
+import { executionToolDefinitions, handleExecutionTool } from './tools/execution.js';
+import { credentialToolDefinitions, handleCredentialTool } from './tools/credential.js';
 
 // --- Interfaces ---
-// OpenAPI types (simplified)
 interface OpenApiPathItem {
     summary?: string;
     description?: string;
-    parameters?: any[]; // Simplified
-    requestBody?: any; // Simplified
-    responses?: any; // Simplified
+    parameters?: unknown[];
+    requestBody?: unknown;
+    responses?: unknown;
     tags?: string[];
-    // Methods like get, post, put, delete, etc.
-    [method: string]: any;
+    [method: string]: unknown;
 }
 
 interface OpenApiSpec {
     openapi: string;
     info: { title: string; version: string; };
     paths: { [path: string]: OpenApiPathItem };
-    // components, servers, etc. - not used in this basic loader
-}
-
-
-interface ApiEndpoint {
-    id: number;
-    path: string;
-    method: string;
-    summary?: string;
-    description?: string;
-    parameters?: string; // JSON
-    requestBody?: string; // JSON
-    responses?: string; // JSON
-    tags?: string; // JSON
 }
 
 interface FastMemoryEntry {
@@ -58,40 +47,37 @@ interface FastMemoryEntry {
     natural_language_query: string;
     api_path: string;
     api_method: string;
-    api_params?: string; // JSON
-    api_data?: string; // JSON
+    api_params?: string;
+    api_data?: string;
     description?: string;
     created_at: string;
 }
 
 // --- Configuration ---
-const N8N_URL = process.env.N8N_URL || 'http://localhost:5678'; // Default to localhost if not set
-const N8N_API_KEY = process.env.N8N_API_KEY || 'YOUR_N8N_API_KEY'; // Placeholder
+const N8N_URL = process.env.N8N_URL || 'http://localhost:5678';
+const N8N_API_KEY = process.env.N8N_API_KEY || 'YOUR_N8N_API_KEY';
 
 if (N8N_API_KEY === 'YOUR_N8N_API_KEY') {
     console.warn("Warning: N8N_API_KEY environment variable not set. Using placeholder.");
 }
 
-// --- Database and API Client Initialization ---
+// --- Database and API Client ---
 let apiSpecDb: sqlite3.Database;
 let fastMemoryDb: sqlite3.Database;
 let axiosInstance: AxiosInstance;
 
-/**
- * Initializes databases and the Axios instance.
- */
 async function initializeServer() {
     const dbs = await setupDatabases();
     apiSpecDb = dbs.apiSpecDb;
     fastMemoryDb = dbs.fastMemoryDb;
 
     axiosInstance = axios.create({
-        baseURL: `${N8N_URL}/api/v1`, // Assuming v1 API, adjust if needed
+        baseURL: `${N8N_URL}/api/v1`,
         headers: {
-            'Authorization': `Bearer ${N8N_API_KEY}`, // Or use 'X-N8N-API-Key' depending on n8n config
+            'X-N8N-API-KEY': N8N_API_KEY,
             'Content-Type': 'application/json',
         },
-        timeout: 15000, // 15 second timeout
+        timeout: 15000,
     });
 
     console.log(`n8n MCP Server initialized. Target URL: ${N8N_URL}`);
@@ -100,20 +86,19 @@ async function initializeServer() {
 // --- MCP Server Setup ---
 const server = new Server(
   {
-    name: "n8n-api-mcp", // Matches folder name
-    version: "0.1.0",
-    description: "MCP Server for interacting with n8n API and managing fast memory.",
+    name: "n8n-api-mcp",
+    version: "0.2.0",
+    description: "MCP Server for n8n API with workflow building, execution, and credential tools.",
   },
   {
     capabilities: {
-      // Resources not implemented in this version, focusing on tools
       tools: {},
     },
   }
 );
 
 // --- Tool Definitions ---
-const toolDefinitions = [
+const coreToolDefinitions = [
     {
         name: "search_api_endpoints",
         description: "Search available n8n API endpoints stored in the local spec database.",
@@ -210,7 +195,6 @@ const toolDefinitions = [
             type: "object",
             properties: {
                 json_file_path: { type: "string", description: "Absolute path to the OpenAPI/Swagger JSON file." }
-                // Could add options for clearing existing data, etc.
             },
             required: ["json_file_path"]
         }
@@ -218,7 +202,7 @@ const toolDefinitions = [
     {
         name: "clear_fast_memory",
         description: "Clear all entries from the fast memory database.",
-        inputSchema: { type: "object", properties: {} } // No arguments needed
+        inputSchema: { type: "object", properties: {} }
     },
     {
         name: "send_raw_api_request",
@@ -230,59 +214,35 @@ const toolDefinitions = [
             },
             required: ["raw_request"]
         }
+    },
+    {
+        name: "download_api_spec",
+        description: "Download the latest n8n OpenAPI specification from GitHub and load it into the local database. Updates the API endpoint search database.",
+        inputSchema: {
+            type: "object",
+            properties: {},
+            required: []
+        }
     }
 ];
 
-// --- State Tracking ---
-// Track if the most recent execute_api_call result came from fast memory
-let lastCallFromFastMemory = false;
-let lastSuccessfulCallDetails: { path: string, method: string, params?: object, data?: object } | null = null;
+// Combine all tool definitions
+const allToolDefinitions = [
+    ...coreToolDefinitions,
+    ...workflowToolDefinitions,
+    ...executionToolDefinitions,
+    ...credentialToolDefinitions
+];
 
-
-// --- API Call Helper ---
-async function makeN8nApiRequest(
-    method: string,
-    path: string,
-    params: any = {},
-    data: any = {}
-): Promise<any> {
-    try {
-        const response = await axiosInstance.request({
-            method: method.toUpperCase(),
-            url: path,
-            params: params,
-            data: data,
-        });
-        logger.info(`API call ${method.toUpperCase()} ${path} successful (Status: ${response.status})`);
-        return response.data;
-    } catch (error: any) {
-        logger.error(`API call ${method.toUpperCase()} ${path} failed:`, error);
-        let errorMessage = `n8n API request failed for ${method.toUpperCase()} ${path}.`;
-        let errorCode = ErrorCode.InternalError;
-
-        if (axios.isAxiosError(error)) {
-            errorMessage = `n8n API error: ${error.response?.status} ${error.response?.statusText}. Response: ${JSON.stringify(error.response?.data)}`;
-            if (error.response?.status === 401 || error.response?.status === 403) {
-                errorCode = ErrorCode.InvalidRequest; // Treat auth errors as invalid request from MCP perspective
-                errorMessage += " Check your N8N_API_KEY.";
-            } else if (error.response?.status === 404) {
-                errorCode = ErrorCode.InvalidRequest; // Endpoint not found
-            } else if (error.response?.status && error.response.status >= 400 && error.response.status < 500) {
-                errorCode = ErrorCode.InvalidParams; // Likely bad input data/params
-            }
-        } else if (error.message) {
-            errorMessage += ` ${error.message}`;
-        }
-        // Throw an MCPError that the main handler can catch
-        throw new McpError(errorCode, errorMessage);
-    }
-}
-
+// --- Logging ---
+const logger = {
+    info: (message: string, ...optionalParams: unknown[]) => console.log(`[INFO] ${message}`, ...optionalParams),
+    warn: (message: string, ...optionalParams: unknown[]) => console.warn(`[WARN] ${message}`, ...optionalParams),
+    error: (message: string, ...optionalParams: unknown[]) => console.error(`[ERROR] ${message}`, ...optionalParams),
+};
 
 // --- Database Helper Functions ---
-
-// Helper to run a DB query that returns multiple rows
-function dbAll(db: sqlite3.Database, sql: string, params: any[] = []): Promise<any[]> {
+function dbAll(db: sqlite3.Database, sql: string, params: unknown[] = []): Promise<unknown[]> {
     return new Promise((resolve, reject) => {
         db.all(sql, params, (err, rows) => {
             if (err) {
@@ -295,10 +255,9 @@ function dbAll(db: sqlite3.Database, sql: string, params: any[] = []): Promise<a
     });
 }
 
-// Helper to run a DB query that affects rows (INSERT, UPDATE, DELETE)
-function dbRun(db: sqlite3.Database, sql: string, params: any[] = []): Promise<{ lastID: number, changes: number }> {
+function dbRun(db: sqlite3.Database, sql: string, params: unknown[] = []): Promise<{ lastID: number, changes: number }> {
     return new Promise((resolve, reject) => {
-        db.run(sql, params, function (err) { // Use function() to access this context
+        db.run(sql, params, function (err) {
             if (err) {
                 console.error("DB Error (run):", err.message, "SQL:", sql, "Params:", params);
                 reject(new McpError(ErrorCode.InternalError, `Database operation failed: ${err.message}`));
@@ -309,30 +268,71 @@ function dbRun(db: sqlite3.Database, sql: string, params: any[] = []): Promise<{
     });
 }
 
+// --- API Call Helper ---
+async function makeN8nApiRequest(
+    method: string,
+    path: string,
+    params: Record<string, unknown> = {},
+    data: Record<string, unknown> = {}
+): Promise<unknown> {
+    try {
+        const response = await axiosInstance.request({
+            method: method.toUpperCase(),
+            url: path,
+            params: params,
+            data: data,
+        });
+        logger.info(`API call ${method.toUpperCase()} ${path} successful (Status: ${response.status})`);
+        return response.data;
+    } catch (error: unknown) {
+        logger.error(`API call ${method.toUpperCase()} ${path} failed:`, error);
+        let errorMessage = `n8n API request failed for ${method.toUpperCase()} ${path}.`;
+        let errorCode = ErrorCode.InternalError;
+
+        if (axios.isAxiosError(error)) {
+            errorMessage = `n8n API error: ${error.response?.status} ${error.response?.statusText}. Response: ${JSON.stringify(error.response?.data)}`;
+            if (error.response?.status === 401 || error.response?.status === 403) {
+                errorCode = ErrorCode.InvalidRequest;
+                errorMessage += " Check your N8N_API_KEY.";
+            } else if (error.response?.status === 404) {
+                errorCode = ErrorCode.InvalidRequest;
+            } else if (error.response?.status && error.response.status >= 400 && error.response.status < 500) {
+                errorCode = ErrorCode.InvalidParams;
+            }
+        } else if (error instanceof Error) {
+            errorMessage += ` ${error.message}`;
+        }
+        throw new McpError(errorCode, errorMessage);
+    }
+}
 
 // --- Tool Handlers ---
-
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return { tools: toolDefinitions };
+  return { tools: allToolDefinitions };
 });
 
-// Centralized logging for tool calls
-const logger = {
-    info: (message: string, ...optionalParams: any[]) => console.log(`[INFO] ${message}`, ...optionalParams),
-    warn: (message: string, ...optionalParams: any[]) => console.warn(`[WARN] ${message}`, ...optionalParams),
-    error: (message: string, ...optionalParams: any[]) => console.error(`[ERROR] ${message}`, ...optionalParams),
-};
-
+// Tool name sets for routing
+const workflowTools = new Set(workflowToolDefinitions.map(t => t.name));
+const executionTools = new Set(executionToolDefinitions.map(t => t.name));
+const credentialTools = new Set(credentialToolDefinitions.map(t => t.name));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
     logger.info(`Executing tool: ${name}`, args);
 
-    // Reset state flags before handling the call
-    lastCallFromFastMemory = false;
-    lastSuccessfulCallDetails = null;
-
     try {
+        // Route to modular handlers
+        if (workflowTools.has(name)) {
+            return await handleWorkflowTool(name, args as Record<string, unknown>, axiosInstance);
+        }
+        if (executionTools.has(name)) {
+            return await handleExecutionTool(name, args as Record<string, unknown>, axiosInstance);
+        }
+        if (credentialTools.has(name)) {
+            return await handleCredentialTool(name, args as Record<string, unknown>, axiosInstance);
+        }
+
+        // Handle core tools
         switch (name) {
             case "search_api_endpoints": {
                 const { query, limit = 10 } = args as { query: string, limit?: number };
@@ -347,64 +347,64 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 `;
                 const params = Array(5).fill(`%${query}%`).concat(limit);
                 const rows = await dbAll(apiSpecDb, sql, params);
-                return { content: [{ type: "application/json", text: JSON.stringify(rows, null, 2) }] };
+                return { content: [{ type: "text", text: JSON.stringify(rows, null, 2) }] };
             }
+
             case "get_api_endpoint_details": {
                 const { path, method } = args as { path: string, method: string };
                 if (!path || !method) throw new McpError(ErrorCode.InvalidParams, "Path and method are required.");
 
                 const sql = `SELECT * FROM endpoints WHERE path = ? AND method = ? LIMIT 1;`;
-                const rows = await dbAll(apiSpecDb, sql, [path, method.toUpperCase()]);
+                const rows = await dbAll(apiSpecDb, sql, [path, method.toUpperCase()]) as Record<string, unknown>[];
 
                 if (rows.length === 0) {
-                    // Use InvalidRequest when the specific endpoint details aren't found in the DB
                     throw new McpError(ErrorCode.InvalidRequest, `Endpoint details not found in database: ${method.toUpperCase()} ${path}`);
                 }
-                 // Parse JSON fields before returning
+
                 const endpoint = rows[0];
                 try {
-                    endpoint.parameters = endpoint.parameters ? JSON.parse(endpoint.parameters) : null;
-                    endpoint.requestBody = endpoint.requestBody ? JSON.parse(endpoint.requestBody) : null;
-                    endpoint.responses = endpoint.responses ? JSON.parse(endpoint.responses) : null;
-                    endpoint.tags = endpoint.tags ? JSON.parse(endpoint.tags) : null; // Assuming tags stored as JSON array string
-                } catch (parseError: any) {
-                    console.warn(`Failed to parse JSON fields for endpoint ${method} ${path}: ${parseError.message}`);
-                    // Return raw strings if parsing fails
+                    if (typeof endpoint.parameters === 'string') endpoint.parameters = JSON.parse(endpoint.parameters);
+                    if (typeof endpoint.requestBody === 'string') endpoint.requestBody = JSON.parse(endpoint.requestBody);
+                    if (typeof endpoint.responses === 'string') endpoint.responses = JSON.parse(endpoint.responses);
+                    if (typeof endpoint.tags === 'string') endpoint.tags = JSON.parse(endpoint.tags);
+                } catch (parseError) {
+                    console.warn(`Failed to parse JSON fields for endpoint ${method} ${path}`);
                 }
-                return { content: [{ type: "application/json", text: JSON.stringify(endpoint, null, 2) }] };
+                return { content: [{ type: "text", text: JSON.stringify(endpoint, null, 2) }] };
             }
+
             case "execute_api_call": {
-                let { path, method, params, data } = args as { path: string, method: string, params?: object, data?: object };
+                let { path, method, params, data } = args as {
+                    path: string;
+                    method: string;
+                    params?: Record<string, unknown>;
+                    data?: Record<string, unknown>;
+                };
                 if (!path || !method) throw new McpError(ErrorCode.InvalidParams, "Path and method are required.");
 
                 // Check Fast Memory first
-                const fastMemorySql = `SELECT * FROM fast_memory WHERE path = ? AND method = ? LIMIT 1`;
-                const fastResults = await dbAll(fastMemoryDb, fastMemorySql, [path, method.toUpperCase()]);
+                const fastMemorySql = `SELECT * FROM fast_memory WHERE api_path = ? AND api_method = ? LIMIT 1`;
+                const fastResults = await dbAll(fastMemoryDb, fastMemorySql, [path, method.toUpperCase()]) as FastMemoryEntry[];
 
+                let lastCallFromFastMemory = false;
                 let fastMemoryEntry: FastMemoryEntry | null = null;
+
                 if (fastResults.length > 0) {
-                    fastMemoryEntry = fastResults[0] as FastMemoryEntry;
+                    fastMemoryEntry = fastResults[0];
                     logger.info(`Found matching entry in fast memory (ID: ${fastMemoryEntry.id}) for ${method} ${path}`);
                     lastCallFromFastMemory = true;
-                    // Use saved params/data if not provided in the current call
                     if (!params && fastMemoryEntry.api_params) {
-                        try { params = JSON.parse(fastMemoryEntry.api_params); } catch { /* ignore parse error */ }
+                        try { params = JSON.parse(fastMemoryEntry.api_params); } catch { /* ignore */ }
                     }
                     if (!data && fastMemoryEntry.api_data) {
-                        try { data = JSON.parse(fastMemoryEntry.api_data); } catch { /* ignore parse error */ }
+                        try { data = JSON.parse(fastMemoryEntry.api_data); } catch { /* ignore */ }
                     }
-                    // Increment usage count (fire and forget)
                     dbRun(fastMemoryDb, `UPDATE fast_memory SET usage_count = usage_count + 1 WHERE id = ?`, [fastMemoryEntry.id])
-                        .catch(err => logger.error(`Failed to increment usage count for fast memory ID ${fastMemoryEntry?.id}: ${err.message}`));
+                        .catch(err => logger.error(`Failed to increment usage count: ${err}`));
                 }
 
-                // Execute the API call using the helper
                 const result = await makeN8nApiRequest(method, path, params, data);
 
-                // Store details for potential saving
-                lastSuccessfulCallDetails = { path, method, params, data };
-
-                // Format response and add context/save prompt
                 let responseText = JSON.stringify(result, null, 2);
                 let messagePrefix = "";
                 let saveSuggestion = "";
@@ -412,37 +412,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 if (lastCallFromFastMemory && fastMemoryEntry) {
                     messagePrefix = `[Using query from Fast Memory: ${fastMemoryEntry.description || `ID ${fastMemoryEntry.id}`}]\n\n`;
                 } else {
-                    // Format save suggestion
                     const paramsStr = params ? `, params: ${JSON.stringify(params)}` : '';
                     const dataStr = data ? `, data: ${JSON.stringify(data)}` : '';
                     saveSuggestion = `\n\n---\nAPI call successful. To save this to Fast Memory for future use:\n` +
-                                     `save_to_fast_memory(description="YOUR_DESCRIPTION", path="${path}", method="${method.toUpperCase()}"${paramsStr}${dataStr})`;
+                                     `save_to_fast_memory(description="YOUR_DESCRIPTION", api_path="${path}", api_method="${method.toUpperCase()}"${paramsStr}${dataStr})`;
                 }
 
-                 // Truncate large responses
-                const MAX_RESPONSE_LENGTH = 5000; // Adjust as needed
+                const MAX_RESPONSE_LENGTH = 5000;
                 if (responseText.length > MAX_RESPONSE_LENGTH) {
                     responseText = responseText.substring(0, MAX_RESPONSE_LENGTH) + "\n... (Response truncated)";
                 }
 
-
-                return { content: [{ type: "application/json", text: messagePrefix + responseText + saveSuggestion }] };
+                return { content: [{ type: "text", text: messagePrefix + responseText + saveSuggestion }] };
             }
+
             case "natural_language_api_search": {
                 const { query, max_results = 5 } = args as { query: string, max_results?: number };
                 if (!query) throw new McpError(ErrorCode.InvalidParams, "Query is required.");
 
-                // 1. Check Fast Memory
                 const fastMemorySql = `SELECT * FROM fast_memory WHERE natural_language_query LIKE ? LIMIT 1`;
-                const fastResults = await dbAll(fastMemoryDb, fastMemorySql, [`%${query}%`]);
+                const fastResults = await dbAll(fastMemoryDb, fastMemorySql, [`%${query}%`]) as FastMemoryEntry[];
 
                 if (fastResults.length > 0) {
-                    const entry = fastResults[0] as FastMemoryEntry;
+                    const entry = fastResults[0];
                     console.log(`Found match in fast memory for query: "${query}"`);
-                    // Return the stored API call details
                     return {
                         content: [{
-                            type: "application/json",
+                            type: "text",
                             text: JSON.stringify({
                                 message: "Found match in fast memory.",
                                 entry: {
@@ -460,26 +456,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     };
                 }
 
-                // 2. If not in fast memory, search API Spec DB
                 console.log(`No match in fast memory for query: "${query}". Searching API spec DB...`);
                 const specSql = `
                     SELECT id, path, method, summary, description, tags
                     FROM endpoints
                     WHERE summary LIKE ? OR description LIKE ? OR path LIKE ? OR tags LIKE ?
-                    ORDER BY length(summary) -- Prioritize matches in summary/desc
+                    ORDER BY length(summary)
                     LIMIT ?;
                 `;
-                 // Prioritize summary/description, then path/tags
                 const specParams = [`%${query}%`, `%${query}%`, `%${query}%`, `%${query}%`, max_results];
                 const specResults = await dbAll(apiSpecDb, specSql, specParams);
 
-                if (specResults.length === 0) {
+                if ((specResults as unknown[]).length === 0) {
                      return { content: [{ type: "text", text: `No match found in fast memory or API spec for query: "${query}"` }] };
                 }
 
                 return {
                     content: [{
-                        type: "application/json",
+                        type: "text",
                         text: JSON.stringify({
                             message: `Found potential matches in API spec database for query: "${query}"`,
                             results: specResults
@@ -487,6 +481,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     }]
                 };
             }
+
             case "save_to_fast_memory": {
                 const {
                     natural_language_query,
@@ -496,12 +491,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     api_data = {},
                     description = ''
                 } = args as {
-                    natural_language_query: string,
-                    api_path: string,
-                    api_method: string,
-                    api_params?: object,
-                    api_data?: object,
-                    description?: string
+                    natural_language_query: string;
+                    api_path: string;
+                    api_method: string;
+                    api_params?: object;
+                    api_data?: object;
+                    description?: string;
                 };
 
                 if (!natural_language_query || !api_path || !api_method) {
@@ -519,7 +514,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         description = excluded.description,
                         created_at = CURRENT_TIMESTAMP;
                 `;
-                const params = [
+                const sqlParams = [
                     natural_language_query,
                     api_path,
                     api_method.toUpperCase(),
@@ -528,26 +523,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     description
                 ];
 
-                const result = await dbRun(fastMemoryDb, sql, params);
+                const result = await dbRun(fastMemoryDb, sql, sqlParams);
                 const message = result.changes > 0 ? `Saved/Updated fast memory entry (ID: ${result.lastID}) for query: "${natural_language_query}"` : "Failed to save to fast memory (no changes detected).";
                 console.log(message);
                 return { content: [{ type: "text", text: message }] };
             }
+
             case "list_fast_memory": {
                 const { search_term, limit = 20 } = args as { search_term?: string, limit?: number };
                 let sql = `SELECT id, natural_language_query, api_path, api_method, description, created_at FROM fast_memory`;
-                const params: any[] = [];
+                const sqlParams: unknown[] = [];
 
                 if (search_term) {
                     sql += ` WHERE natural_language_query LIKE ? OR description LIKE ?`;
-                    params.push(`%${search_term}%`, `%${search_term}%`);
+                    sqlParams.push(`%${search_term}%`, `%${search_term}%`);
                 }
                 sql += ` ORDER BY created_at DESC LIMIT ?`;
-                params.push(limit);
+                sqlParams.push(limit);
 
-                const rows = await dbAll(fastMemoryDb, sql, params);
-                return { content: [{ type: "application/json", text: JSON.stringify(rows, null, 2) }] };
+                const rows = await dbAll(fastMemoryDb, sql, sqlParams);
+                return { content: [{ type: "text", text: JSON.stringify(rows, null, 2) }] };
             }
+
             case "delete_from_fast_memory": {
                 const { id } = args as { id: number };
                 if (typeof id !== 'number') throw new McpError(ErrorCode.InvalidParams, "A numeric ID is required.");
@@ -559,20 +556,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 console.log(message);
                 return { content: [{ type: "text", text: message }] };
             }
+
             case "clear_fast_memory": {
                 const sql = `DELETE FROM fast_memory;`;
-                const vacuumSql = `VACUUM;`; // Clean up space after deleting
+                const vacuumSql = `VACUUM;`;
                 const result = await dbRun(fastMemoryDb, sql);
-                await dbRun(fastMemoryDb, vacuumSql); // Run vacuum separately
+                await dbRun(fastMemoryDb, vacuumSql);
                 const message = `Cleared ${result.changes} entries from fast memory.`;
                 logger.info(message);
                 return { content: [{ type: "text", text: message }] };
             }
+
             case "send_raw_api_request": {
                 const { raw_request } = args as { raw_request: string };
                 if (!raw_request) throw new McpError(ErrorCode.InvalidParams, "raw_request string is required.");
 
-                // Basic parsing - assumes "METHOD /path?query=val {JSON_BODY}" or "METHOD /path"
                 const parts = raw_request.trim().match(/^(\S+)\s+(\S+)(?:\s+(.*))?$/);
                 if (!parts) throw new McpError(ErrorCode.InvalidParams, "Invalid raw_request format. Use 'METHOD /path?query=val [JSON_BODY]'");
 
@@ -581,7 +579,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const bodyString = parts[3];
 
                 let path = pathAndQuery;
-                let params: any = {};
+                let params: Record<string, unknown> = {};
                 const queryIndex = pathAndQuery.indexOf('?');
                 if (queryIndex !== -1) {
                     path = pathAndQuery.substring(0, queryIndex);
@@ -589,170 +587,226 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     params = Object.fromEntries(new URLSearchParams(queryString));
                 }
 
-                let data: any = null;
+                let data: Record<string, unknown> | null = null;
                 if (bodyString) {
                     try {
                         data = JSON.parse(bodyString);
-                    } catch (e: any) {
-                        throw new McpError(ErrorCode.InvalidParams, `Invalid JSON body provided: ${e.message}`);
+                    } catch (e: unknown) {
+                        const error = e as Error;
+                        throw new McpError(ErrorCode.InvalidParams, `Invalid JSON body provided: ${error.message}`);
                     }
                 }
 
-                // Use the standard execute_api_call logic (which includes fast memory check & save prompt)
-                // Need to reconstruct args for the internal call
-                const reconstructedArgs = { path, method, params, data };
-                // Directly call the logic block for execute_api_call
-                 logger.info(`Executing raw request as: ${method} ${path}`, { params, data });
-                 // Re-use the execute_api_call logic by calling it directly
-                 // This avoids duplicating the fast memory check and save prompt logic
-                 // We pass the parsed arguments to it.
-                 // Note: This assumes execute_api_call case doesn't rely on specific request context
-                 // that isn't captured in args.
-                 // Simulate calling the execute_api_call case:
-                 const executeArgs = { path, method, params: params || undefined, data: data || undefined };
-                 // Find the 'execute_api_call' case logic and execute it with executeArgs
-                 // This is a bit of a workaround; ideally, the core logic would be in a separate function.
-                 // For now, we'll just call makeN8nApiRequest directly and handle response formatting.
+                logger.info(`Executing raw request as: ${method} ${path}`, { params, data });
+                const result = await makeN8nApiRequest(method, path, params, data || {});
 
-                 const result = await makeN8nApiRequest(method, path, params, data);
-                 lastSuccessfulCallDetails = { path, method, params, data }; // Store for potential save
+                let responseText = JSON.stringify(result, null, 2);
+                let saveSuggestion = "";
 
-                 let responseText = JSON.stringify(result, null, 2);
-                 let saveSuggestion = "";
-                 // Only suggest saving if it wasn't found in fast memory (makeN8nApiRequest doesn't check)
-                 // We need to explicitly check fast memory here if we want the save prompt
-                 const fastMemorySql = `SELECT id FROM fast_memory WHERE path = ? AND method = ? LIMIT 1`;
-                 const fastResults = await dbAll(fastMemoryDb, fastMemorySql, [path, method.toUpperCase()]);
-                 if (fastResults.length === 0) {
-                     const paramsStr = params ? `, params: ${JSON.stringify(params)}` : '';
-                     const dataStr = data ? `, data: ${JSON.stringify(data)}` : '';
-                     saveSuggestion = `\n\n---\nAPI call successful. To save this to Fast Memory for future use:\n` +
-                                      `save_to_fast_memory(description="YOUR_DESCRIPTION", path="${path}", method="${method.toUpperCase()}"${paramsStr}${dataStr})`;
-                 }
+                const fastMemorySql = `SELECT id FROM fast_memory WHERE api_path = ? AND api_method = ? LIMIT 1`;
+                const fastResults = await dbAll(fastMemoryDb, fastMemorySql, [path, method.toUpperCase()]);
+                if ((fastResults as unknown[]).length === 0) {
+                    const paramsStr = Object.keys(params).length > 0 ? `, api_params: ${JSON.stringify(params)}` : '';
+                    const dataStr = data ? `, api_data: ${JSON.stringify(data)}` : '';
+                    saveSuggestion = `\n\n---\nAPI call successful. To save this to Fast Memory for future use:\n` +
+                                     `save_to_fast_memory(description="YOUR_DESCRIPTION", api_path="${path}", api_method="${method.toUpperCase()}"${paramsStr}${dataStr})`;
+                }
 
-                 const MAX_RESPONSE_LENGTH = 5000;
-                 if (responseText.length > MAX_RESPONSE_LENGTH) {
-                     responseText = responseText.substring(0, MAX_RESPONSE_LENGTH) + "\n... (Response truncated)";
-                 }
+                const MAX_RESPONSE_LENGTH = 5000;
+                if (responseText.length > MAX_RESPONSE_LENGTH) {
+                    responseText = responseText.substring(0, MAX_RESPONSE_LENGTH) + "\n... (Response truncated)";
+                }
 
-                 return { content: [{ type: "application/json", text: responseText + saveSuggestion }] };
-
+                return { content: [{ type: "text", text: responseText + saveSuggestion }] };
             }
-             case "load_api_spec_from_json": {
-                 const { json_file_path } = args as { json_file_path: string };
-                 if (!json_file_path) throw new McpError(ErrorCode.InvalidParams, "JSON file path is required.");
 
-                 logger.info(`Attempting to load API spec from: ${json_file_path}`);
+            case "load_api_spec_from_json": {
+                const { json_file_path } = args as { json_file_path: string };
+                if (!json_file_path) throw new McpError(ErrorCode.InvalidParams, "JSON file path is required.");
+                if (!json_file_path.toLowerCase().endsWith('.json')) {
+                    throw new McpError(ErrorCode.InvalidParams, "Only .json files are allowed for security reasons.");
+                }
 
-                 // 1. Read the JSON file
-                 let specContent: string;
-                 try {
-                     specContent = await fs.readFile(json_file_path, 'utf-8');
-                 } catch (readError: any) {
-                     console.error(`Failed to read API spec file: ${readError.message}`);
-                     throw new McpError(ErrorCode.InvalidParams, `Failed to read file at path: ${json_file_path}. Error: ${readError.message}`);
-                 }
+                logger.info(`Attempting to load API spec from: ${json_file_path}`);
 
-                 // 2. Parse the JSON
-                 let spec: OpenApiSpec;
-                 try {
-                     spec = JSON.parse(specContent);
-                     if (!spec.openapi || !spec.paths) {
-                         throw new Error("Invalid OpenAPI format: Missing 'openapi' version or 'paths'.");
-                     }
-                     console.log(`Parsed OpenAPI spec version ${spec.openapi}, title: ${spec.info?.title}`);
-                 } catch (parseError: any) {
-                     console.error(`Failed to parse API spec JSON: ${parseError.message}`);
-                     throw new McpError(ErrorCode.InvalidParams, `Failed to parse JSON from file: ${json_file_path}. Error: ${parseError.message}`);
-                 }
+                let specContent: string;
+                try {
+                    specContent = await fs.readFile(json_file_path, 'utf-8');
+                } catch (readError: unknown) {
+                    const error = readError as Error;
+                    console.error(`Failed to read API spec file: ${error.message}`);
+                    throw new McpError(ErrorCode.InvalidParams, `Failed to read file at path: ${json_file_path}. Error: ${error.message}`);
+                }
 
-                 // 3. Prepare and Insert data into DB
-                 const insertSql = `
-                    INSERT OR REPLACE INTO endpoints (path, method, summary, description, parameters, requestBody, responses, tags)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?);
-                 `;
+                let spec: OpenApiSpec;
+                try {
+                    spec = JSON.parse(specContent);
+                    if (!spec.openapi || !spec.paths) {
+                        throw new Error("Invalid OpenAPI format: Missing 'openapi' version or 'paths'.");
+                    }
+                    console.log(`Parsed OpenAPI spec version ${spec.openapi}, title: ${spec.info?.title}`);
+                } catch (parseError: unknown) {
+                    const error = parseError as Error;
+                    console.error(`Failed to parse API spec JSON: ${error.message}`);
+                    throw new McpError(ErrorCode.InvalidParams, `Failed to parse JSON from file: ${json_file_path}. Error: ${error.message}`);
+                }
 
-                 let endpointsAdded = 0;
-                 let endpointsFailed = 0;
+                const insertSql = `
+                   INSERT OR REPLACE INTO endpoints (path, method, summary, description, parameters, requestBody, responses, tags)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                `;
 
-                 // Use a transaction for bulk insert
-                 await dbRun(apiSpecDb, 'BEGIN TRANSACTION;');
+                let endpointsAdded = 0;
+                let endpointsFailed = 0;
 
-                 try {
-                     for (const apiPath in spec.paths) {
-                         const pathItem = spec.paths[apiPath];
-                         for (const method in pathItem) {
-                             // Filter out non-HTTP methods (like 'summary', 'description', 'parameters' at path level)
-                             if (['get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'trace'].includes(method.toLowerCase())) {
-                                 const endpointData = pathItem[method];
-                                 const params = [
-                                     apiPath,
-                                     method.toUpperCase(),
-                                     endpointData.summary || null,
-                                     endpointData.description || null,
-                                     endpointData.parameters ? JSON.stringify(endpointData.parameters) : null,
-                                     endpointData.requestBody ? JSON.stringify(endpointData.requestBody) : null,
-                                     endpointData.responses ? JSON.stringify(endpointData.responses) : null,
-                                     endpointData.tags ? JSON.stringify(endpointData.tags) : null,
-                                 ];
-                                 try {
-                                     await dbRun(apiSpecDb, insertSql, params);
-                                     endpointsAdded++;
-                                 } catch (insertError: any) {
-                                     console.error(`Failed to insert endpoint ${method.toUpperCase()} ${apiPath}: ${insertError.message}`);
-                                     endpointsFailed++;
-                                 }
-                             }
-                         }
-                     }
-                     await dbRun(apiSpecDb, 'COMMIT;');
-                     const message = `API Spec Load Complete. Added/Updated: ${endpointsAdded}, Failed: ${endpointsFailed}.`;
-                     console.log(message);
-                     return { content: [{ type: "text", text: message }] };
+                await dbRun(apiSpecDb, 'BEGIN TRANSACTION;');
 
-                 } catch (transactionError: any) {
-                     console.error("Transaction failed during API spec load:", transactionError);
-                     await dbRun(apiSpecDb, 'ROLLBACK;'); // Rollback on error
-                     throw new McpError(ErrorCode.InternalError, `Database transaction failed during spec load: ${transactionError.message}`);
-                 }
+                try {
+                    for (const apiPath in spec.paths) {
+                        const pathItem = spec.paths[apiPath];
+                        for (const method in pathItem) {
+                            if (['get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'trace'].includes(method.toLowerCase())) {
+                                const endpointData = pathItem[method] as OpenApiPathItem;
+                                const sqlParams = [
+                                    apiPath,
+                                    method.toUpperCase(),
+                                    endpointData.summary || null,
+                                    endpointData.description || null,
+                                    endpointData.parameters ? JSON.stringify(endpointData.parameters) : null,
+                                    endpointData.requestBody ? JSON.stringify(endpointData.requestBody) : null,
+                                    endpointData.responses ? JSON.stringify(endpointData.responses) : null,
+                                    endpointData.tags ? JSON.stringify(endpointData.tags) : null,
+                                ];
+                                try {
+                                    await dbRun(apiSpecDb, insertSql, sqlParams);
+                                    endpointsAdded++;
+                                } catch (insertError: unknown) {
+                                    const error = insertError as Error;
+                                    console.error(`Failed to insert endpoint ${method.toUpperCase()} ${apiPath}: ${error.message}`);
+                                    endpointsFailed++;
+                                }
+                            }
+                        }
+                    }
+                    await dbRun(apiSpecDb, 'COMMIT;');
+                    const message = `API Spec Load Complete. Added/Updated: ${endpointsAdded}, Failed: ${endpointsFailed}.`;
+                    console.log(message);
+                    return { content: [{ type: "text", text: message }] };
+
+                } catch (transactionError: unknown) {
+                    const error = transactionError as Error;
+                    console.error("Transaction failed during API spec load:", error);
+                    await dbRun(apiSpecDb, 'ROLLBACK;');
+                    throw new McpError(ErrorCode.InternalError, `Database transaction failed during spec load: ${error.message}`);
+                }
             }
+
+            case "download_api_spec": {
+                const OPENAPI_URL = "https://raw.githubusercontent.com/n8n-io/n8n-docs/main/docs/api/v1/openapi.yml";
+
+                logger.info(`Downloading n8n OpenAPI spec from: ${OPENAPI_URL}`);
+
+                // Download the YAML spec
+                let yamlContent: string;
+                try {
+                    const response = await axios.get(OPENAPI_URL, { timeout: 30000 });
+                    yamlContent = response.data;
+                } catch (downloadError: unknown) {
+                    const error = downloadError as Error;
+                    throw new McpError(ErrorCode.InternalError, `Failed to download OpenAPI spec: ${error.message}`);
+                }
+
+                // Parse YAML to JSON
+                let spec: OpenApiSpec;
+                try {
+                    // Dynamic import of yaml package
+                    const yaml = await import('yaml');
+                    spec = yaml.parse(yamlContent);
+                    if (!spec.openapi || !spec.paths) {
+                        throw new Error("Invalid OpenAPI format: Missing 'openapi' version or 'paths'.");
+                    }
+                    logger.info(`Parsed OpenAPI spec version ${spec.openapi}, title: ${spec.info?.title}`);
+                } catch (parseError: unknown) {
+                    const error = parseError as Error;
+                    throw new McpError(ErrorCode.InternalError, `Failed to parse OpenAPI YAML: ${error.message}`);
+                }
+
+                // Load into database
+                const insertSql = `
+                   INSERT OR REPLACE INTO endpoints (path, method, summary, description, parameters, requestBody, responses, tags)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                `;
+
+                let endpointsAdded = 0;
+                let endpointsFailed = 0;
+
+                await dbRun(apiSpecDb, 'BEGIN TRANSACTION;');
+
+                try {
+                    for (const apiPath in spec.paths) {
+                        const pathItem = spec.paths[apiPath];
+                        for (const method in pathItem) {
+                            if (['get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'trace'].includes(method.toLowerCase())) {
+                                const endpointData = pathItem[method] as OpenApiPathItem;
+                                const sqlParams = [
+                                    apiPath,
+                                    method.toUpperCase(),
+                                    endpointData.summary || null,
+                                    endpointData.description || null,
+                                    endpointData.parameters ? JSON.stringify(endpointData.parameters) : null,
+                                    endpointData.requestBody ? JSON.stringify(endpointData.requestBody) : null,
+                                    endpointData.responses ? JSON.stringify(endpointData.responses) : null,
+                                    endpointData.tags ? JSON.stringify(endpointData.tags) : null,
+                                ];
+                                try {
+                                    await dbRun(apiSpecDb, insertSql, sqlParams);
+                                    endpointsAdded++;
+                                } catch (insertError: unknown) {
+                                    const error = insertError as Error;
+                                    console.error(`Failed to insert endpoint ${method.toUpperCase()} ${apiPath}: ${error.message}`);
+                                    endpointsFailed++;
+                                }
+                            }
+                        }
+                    }
+                    await dbRun(apiSpecDb, 'COMMIT;');
+                    const message = `OpenAPI Spec Downloaded and Loaded!\n\nSource: ${OPENAPI_URL}\nVersion: ${spec.openapi}\nTitle: ${spec.info?.title}\nEndpoints Added/Updated: ${endpointsAdded}\nFailed: ${endpointsFailed}`;
+                    logger.info(message);
+                    return { content: [{ type: "text", text: message }] };
+
+                } catch (transactionError: unknown) {
+                    const error = transactionError as Error;
+                    console.error("Transaction failed during API spec load:", error);
+                    await dbRun(apiSpecDb, 'ROLLBACK;');
+                    throw new McpError(ErrorCode.InternalError, `Database transaction failed: ${error.message}`);
+                }
+            }
+
             default:
                 throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
         }
-    } catch (error: any) {
+    } catch (error: unknown) {
         console.error(`Error executing tool '${name}':`, error);
-        let errorMessage = `Error executing tool '${name}'.`;
-        let errorCode = ErrorCode.InternalError;
 
+        if (error instanceof McpError) {
+            throw error;
+        }
+
+        let errorMessage = `Error executing tool '${name}'.`;
         if (axios.isAxiosError(error)) {
             errorMessage = `n8n API error: ${error.response?.status} ${error.response?.statusText}. ${JSON.stringify(error.response?.data)}`;
-            // Use InvalidRequest for both 401/403 and 404, relying on the message for details
-            if (error.response?.status === 401 || error.response?.status === 403) errorCode = ErrorCode.InvalidRequest; // Or InternalError if more appropriate
-            if (error.response?.status === 404) errorCode = ErrorCode.InvalidRequest;
-            // Add more specific error handling based on n8n status codes if needed
-        } else if (error instanceof McpError) {
-            throw error; // Re-throw MCP specific errors
-        } else if (error.message) {
+        } else if (error instanceof Error) {
             errorMessage += ` ${error.message}`;
         }
 
-        // Return error as structured content
         return {
             content: [{ type: "text", text: errorMessage }],
             isError: true,
-            // Consider adding error code if MCP spec supports it in CallToolResponse
         };
-        // Alternatively, re-throw as McpError:
-        // throw new McpError(errorCode, errorMessage);
     }
 });
 
-
 // --- Server Lifecycle ---
-
-/**
- * Start the server: initialize components and connect transport.
- */
 async function main() {
     try {
         await initializeServer();
@@ -765,9 +819,6 @@ async function main() {
     }
 }
 
-/**
- * Graceful shutdown: close database connections.
- */
 async function shutdown() {
     console.log("Shutting down n8n MCP server...");
     try {
@@ -781,9 +832,7 @@ async function shutdown() {
     }
 }
 
-// Handle SIGINT (Ctrl+C) for graceful shutdown
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-// Start the server
 main();
